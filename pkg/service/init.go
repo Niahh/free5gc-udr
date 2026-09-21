@@ -58,7 +58,10 @@ func NewApp(ctx context.Context, cfg *factory.Config, tlsKeyLogPath string) (*Ud
 	processor := processor.NewProcessor(udr)
 	udr.processor = processor
 
-	consumer := consumer.NewConsumer(udr)
+	consumer, err := consumer.NewConsumer(udr)
+	if err != nil {
+		return nil, err
+	}
 	udr.consumer = consumer
 
 	udr.sbiServer = sbi.NewServer(udr, tlsKeyLogPath)
@@ -150,14 +153,9 @@ func (a *UdrApp) SetReportCaller(reportCaller bool) {
 }
 
 func (u *UdrApp) registerToNrf(ctx context.Context) error {
-	udrContext := u.udrCtx
-
-	nrfUri, nfId, err := u.consumer.SendRegisterNFInstance(ctx, udrContext.NrfUri)
-	if err != nil {
+	if err := u.consumer.SendRegisterNFInstance(ctx, true); err != nil {
 		return fmt.Errorf("send register NFInstance error[%s]", err.Error())
 	}
-	udrContext.NrfUri = nrfUri
-	udrContext.NfId = nfId
 
 	return nil
 }
@@ -185,6 +183,7 @@ func (a *UdrApp) deregisterFromNrf() {
 
 func (a *UdrApp) Start() {
 	err := a.registerToNrf(a.ctx)
+	registered := err == nil
 	if err != nil {
 		logger.InitLog.Errorf("register to NRF failed: %v", err)
 	} else {
@@ -208,9 +207,19 @@ func (a *UdrApp) Start() {
 	defer func() {
 		if p := recover(); p != nil {
 			logger.InitLog.Errorf("panic: %v\n%s", p, string(debug.Stack()))
+			// nothing else cancels the context here, so the wait below would never return
+			a.cancel()
+			a.Consumer().WaitHeartbeatStopped()
 			a.deregisterFromNrf()
 		}
 	}()
+
+	if registered {
+		// Only a registered profile has something to keep alive, and only past the
+		// MongoDB gate above: that early return abandons the profile instead of
+		// deregistering it.
+		a.Consumer().StartHeartbeat(a.ctx, &a.wg)
+	}
 
 	a.sbiServer.Run(&a.wg)
 	if a.cfg.AreMetricsEnabled() && a.metricsServer != nil {
@@ -239,6 +248,10 @@ func (a *UdrApp) Terminate() {
 func (a *UdrApp) terminateProcedure() {
 	logger.MainLog.Infof("Terminating UDR...")
 	a.CallServerStop()
+
+	// no heartbeat PATCH or re-registration PUT may land after the deregistration
+	a.Consumer().WaitHeartbeatStopped()
+
 	a.deregisterFromNrf()
 }
 
